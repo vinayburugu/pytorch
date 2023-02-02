@@ -411,15 +411,13 @@ def get_include_and_linking_paths(
         lpaths = []
         macros = ""
         if sys.platform == "darwin":
-            import pdb
-            pdb.set_trace()
             # GNU OpenMP generally is not available on MacOS
             # There is either Intel OpenMP(for x86) or LLVM OpenMP (for both x86 and arm64)
             libs = ["omp"]
             if os.getenv("CONDA_PREFIX") is not None:
                 # On MacOS OpenMP is not available via the system install
                 # But on conda can be provided using https://anaconda.org/anaconda/llvm-openmp
-                conda_lib_path = os.path.join(os.getenv("CONDA_PREFIX"), "lib"))
+                conda_lib_path = os.path.join(os.getenv("CONDA_PREFIX"), "lib")
                 ipaths.append(os.path.join(os.getenv("CONDA_PREFIX"), "include"))
                 lpaths.append(conda_lib_path)
                 # Prefer Intel OpenMP on x86 machine
