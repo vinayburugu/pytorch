@@ -122,6 +122,11 @@ jobs:
         run: |
           tree /F C:\$Env:GITHUB_RUN_ID\build-results
 
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          ${CONDA_RUN} python3 -mpip install -r .github/requirements/pip-requirements-${{ runner.os }}.txt
+
       - name: Test
         id: test
         shell: bash
