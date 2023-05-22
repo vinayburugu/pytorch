@@ -736,6 +736,9 @@ def print_fx(gm, example_inputs):
     print(gm.graph)
     return gm
 
+def dump_fx(gm, example_inputs):
+    gm.to_folder("fx_dump", "model.fx")
+    return gm
 
 def print_aten_ops(gm, example_inputs):
     from functorch.compile import aot_module
@@ -1284,7 +1287,7 @@ class BenchmarkRunner:
         return record_status(accuracy_status)
 
     def check_tolerance(
-        self, name, model, example_inputs, optimize_ctx 
+        self, name, model, example_inputs, optimize_ctx, save_tensors
     ):
         """
         Checks tolerance.
@@ -1352,6 +1355,13 @@ class BenchmarkRunner:
               return tol
 
             tol = []
+            if save_tensors:
+              t_out_dir = f"models/{name}"  
+              os.makedirs(f"models/{name}", exist_ok=True)  
+              torch.save(example_inputs, f"{t_out_dir}/input_tensors.pt")
+              torch.save(new_result, f"{t_out_dir}/output_tensors.pt")
+              torch.save(example_inputs_copy, f"{t_out_dir}/cpu_input_tensors.pt")
+              torch.save(correct_result, f"{t_out_dir}/cpu_output_tensors.pt")
             dump_max_mean_values(tol, correct_result, new_result)
             tol = torch.cat(tol)
             tol = torch.tensor(tol)
@@ -1360,6 +1370,7 @@ class BenchmarkRunner:
             div = torch.std(tol)
             headers = ["dev", "name", "batch_size", "max", "mean", "std"]
             fields = [current_device, current_name, current_batch_size, max.item(), mean.item(), div.item()]
+            print(f"outputfilename:{output_filename}")
             output_csv(output_filename, headers, fields)
         return tolerance_status
 
@@ -1488,7 +1499,7 @@ class BenchmarkRunner:
             print(status)
         elif self.args.tolerance:
             status = self.check_tolerance(
-                name, model, example_inputs, optimize_ctx
+                name, model, example_inputs, optimize_ctx, self.args.save_io_tensors
             )
             print(status)
         elif self.args.performance:
@@ -1863,6 +1874,11 @@ def parse_args(args=None):
         help="Print fx traces captured from model",
     )
     group.add_argument(
+        "--dump-fx",
+        action="store_true",
+        help="dump fx traces captured from model",
+    )
+    group.add_argument(
         "--print-aten-ops",
         action="store_true",
         help="Print traces of aten ops captured by AOT autograd",
@@ -1908,6 +1924,12 @@ def parse_args(args=None):
         "--tolerance",
         action="store_true",
         help="extracts the tolerance for each model with small batch size and eval mode",
+    )
+    parser.add_argument(
+        "--save-io-tensors",
+        "--save_io_tensors",
+        action="store_true",
+        help="save input and output tensors of the model to a file.",
     )
     return parser.parse_args(args)
 
@@ -2126,7 +2148,10 @@ def run(runner, args, original_dir=None):
     experiment = null_experiment
     global current_name, current_device, current_batch_size, output_filename, optimize_ctx
     optimize_ctx = NullContext()
-
+    
+    if args.save_io_tensors and not args.tolerance:
+        print("error: --save-io-tensors or --save_io_tensors can only be used when --tolerance is used.\n")
+        return
     if args.overhead:
         optimize_ctx = torch._dynamo.optimize(dummy_fx_compile, nopython=args.nopython)
         experiment = speedup_experiment
@@ -2153,6 +2178,11 @@ def run(runner, args, original_dir=None):
             print_fx,
             nopython=args.nopython,
         )
+    elif args.dump_fx:
+        optimize_ctx = torch._dynamo.optimize(
+            dump_fx,
+            nopython=args.nopython,
+        )
     elif args.print_aten_ops:
         optimize_ctx = torch._dynamo.optimize(
             print_aten_ops,
@@ -2170,6 +2200,8 @@ def run(runner, args, original_dir=None):
             output_filename = f"tolerance_{args.backend}.csv"
         else:
             output_filename = f"speedup_{args.backend}.csv"
+    elif args.tolerance:
+        output_filename = "tolerance.csv"
     elif args.recompile_profiler:
         output_filename = "recompile_profiler_log.csv"
         experiment = recompile_profiler_experiment
