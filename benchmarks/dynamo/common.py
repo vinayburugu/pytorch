@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import collections
 import contextlib
@@ -38,13 +37,9 @@ from torch._inductor.utils import fresh_inductor_cache
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
-<<<<<<< HEAD
-from torch.utils._pytree import tree_map,tree_map_only
-=======
 from torch.utils._pytree import tree_map, tree_map_only
 
 from tqdm.auto import tqdm, trange
->>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
 
 try:
     from .microbenchmarks.operator_inp_utils import OperatorInputsMode
@@ -448,13 +443,6 @@ def tensor_is_on_xla(tensors):
         nonlocal result
         if x.device.type == "xla":
             result = True
-<<<<<<< HEAD
-=======
-
-    result = False
-    tree_map_only(torch.Tensor, visit, tensors)
-    return result
->>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
 
     result = False
     tree_map_only(torch.Tensor, visit, tensors)
@@ -2219,12 +2207,10 @@ def parse_args(args=None):
     mode_group.add_argument(
         "--performance", action="store_true", help="Measures performance speedup"
     )
-<<<<<<< HEAD
     mode_group.add_argument(
         "--tolerance",
         action="store_true",
         help="extracts the tolerance for each model with small batch size and eval mode",
-=======
 
     run_mode_group = parser.add_mutually_exclusive_group(required=True)
     run_mode_group.add_argument(
@@ -2234,7 +2220,6 @@ def parse_args(args=None):
     )
     run_mode_group.add_argument(
         "--inference", action="store_true", help="Performs inference"
->>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
     )
     return parser.parse_args(args)
 
