@@ -391,9 +391,8 @@ class Optimizer:
                              "that doesn't match the size of optimizer's group")
 
         # Update the state
-        id_map = {old_id: p for old_id, p in
-                  zip(chain.from_iterable((g['params'] for g in saved_groups)),
-                      chain.from_iterable((g['params'] for g in groups)))}
+        id_map = dict(zip(chain.from_iterable((g['params'] for g in saved_groups)),
+                      chain.from_iterable((g['params'] for g in groups))))
 
         def cast(param, value, key=None):
             r"""Make a deep copy of value, casting all tensors to device of param."""
@@ -433,7 +432,7 @@ class Optimizer:
         self.__setstate__({'state': state, 'param_groups': param_groups})
 
     def zero_grad(self, set_to_none: bool = True):
-        r"""Sets the gradients of all optimized :class:`torch.Tensor` s to zero.
+        r"""Resets the gradients of all optimized :class:`torch.Tensor` s.
 
         Args:
             set_to_none (bool): instead of setting to zero, set the grads to None.
@@ -447,7 +446,7 @@ class Optimizer:
                 (in one case it does the step with a gradient of 0 and in the other it skips
                 the step altogether).
         """
-        foreach = self.defaults.get('foreach', False)
+        foreach = self.defaults.get('foreach', False) or self.defaults.get('fused', False)
 
         if not hasattr(self, "_zero_grad_profile_name"):
             self._patch_step_function()
@@ -469,7 +468,7 @@ class Optimizer:
                             else:
                                 per_device_and_dtype_grads[p.grad.device][p.grad.dtype].append(p.grad)
             if foreach:
-                for _, per_dtype_grads in per_device_and_dtype_grads.items():
+                for per_dtype_grads in per_device_and_dtype_grads.values():
                     for grads in per_dtype_grads.values():
                         torch._foreach_zero_(grads)
 

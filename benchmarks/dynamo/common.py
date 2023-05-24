@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import collections
+import contextlib
 import copy
 import csv
 import functools
 import importlib
-import io
 import itertools
 import logging
 import os
@@ -15,7 +15,9 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from typing import NamedTuple
+
+from typing import Any, NamedTuple
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -29,14 +31,20 @@ from scipy.stats import gmean, ttest_ind
 from torch._dynamo.exc import BackendCompilerFailed
 from torch._dynamo.profiler import fx_insert_profiling, Profiler
 from torch._dynamo.testing import dummy_fx_compile, format_speedup, same
-from torch._dynamo.utils import clone_inputs
+from torch._dynamo.utils import clone_inputs, graph_break_reasons
 from torch._functorch.aot_autograd import set_model_name
 from torch._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
+<<<<<<< HEAD
 from torch.utils._pytree import tree_map,tree_map_only
+=======
+from torch.utils._pytree import tree_map, tree_map_only
+
+from tqdm.auto import tqdm, trange
+>>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
 
 try:
     from .microbenchmarks.operator_inp_utils import OperatorInputsMode
@@ -60,16 +68,22 @@ log = logging.getLogger(__name__)
 # We are primarily interested in TF32
 torch.backends.cuda.matmul.allow_tf32 = True
 
+# Suppress torch.profiler spam
+os.environ["KINETO_LOG_LEVEL"] = "5"
+
 current_name = ""
 current_device = ""
 current_batch_size = None
 output_filename = None
+
+MAX_DOWNLOAD_ATTEMPTS = 5
 
 
 class CI(NamedTuple):
     backend: str  # aot_eager or inductor
     training: bool
     dynamic: bool = False
+    device: str = "cuda"
 
 
 CI_SKIP = collections.defaultdict(list)
@@ -77,11 +91,40 @@ CI_SKIP = collections.defaultdict(list)
 
 # Skips for dynamic=False
 
-CI_SKIP[CI("aot_eager", training=False)] = [
+# Here eager really means dynamo+eager
+CI_SKIP[CI("eager", training=False)] = [
     # TorchBench
     "DALLE2_pytorch",  # AttributeError: text_encodings
-    "demucs",  # OOM
+    # TypeError: pad_center() takes 1 positional argument but 2 were given
+    "tacotron2",
+    # torchrec_dlrm requires gcc-11, https://github.com/pytorch/benchmark/pull/1427
+    "torchrec_dlrm",
+    # Huggingface
+    "DebertaV2ForQuestionAnswering",  # OOM
+]
+
+CI_SKIP[CI("eager", training=True)] = [
+    *CI_SKIP[CI("eager", training=False)],
+    # TorchBench
+    "BERT_pytorch",  # accuracy
+    "Background_Matting",  # fp64_OOM
+    "hf_BigBird",  # fp64_OOM
+    "hf_T5_base",  # fp64_OOM
+    "llama",  # Accuracy failed: allclose not within tol=0.001
+    "vision_maskrcnn",  # The size of tensor a (29) must match the size of tensor b (33) (doesn't repro)
+    # Huggingface
+    "XGLMForCausalLM",  # OOM
+    # TIMM
+    "cait_m36_384",  # fp64_OOM
+    "convit_base",  # fp64_OOM
+    "mobilenetv2_100",  # accuracy
+    "xcit_large_24_p8_224",  # fp64_OOM,
+]
+
+CI_SKIP[CI("aot_eager", training=False)] = [
+    *CI_SKIP[CI("eager", training=False)],
     # all dynamic shapes errors for detectron variants
+    "demucs",  # OOM
     "detectron2_fasterrcnn_r_101_c4",
     "detectron2_fasterrcnn_r_101_dc5",
     "detectron2_fasterrcnn_r_101_fpn",
@@ -93,12 +136,15 @@ CI_SKIP[CI("aot_eager", training=False)] = [
     "detectron2_maskrcnn_r_101_fpn",
     "detectron2_maskrcnn_r_50_c4",
     "detectron2_maskrcnn_r_50_fpn",
-    "moco",  # Please convert all Tensors to FakeTensors first
     "hf_BigBird",  # OOM
     "tacotron2",  # AssertionError: Deduped args out of bounds
     # Huggingface
     "BartForConditionalGeneration",  # OOM
     "DebertaV2ForQuestionAnswering",  # OOM
+    # Torchbench
+    "speech_transformer",  # https://github.com/pytorch/pytorch/issues/99893
+    "pyhpc_isoneutral_mixing",  # https://github.com/pytorch/pytorch/issues/99893
+    "pyhpc_turbulent_kinetic_energy",  # https://github.com/pytorch/pytorch/issues/99893
 ]
 
 CI_SKIP[CI("aot_eager", training=True)] = [
@@ -108,9 +154,7 @@ CI_SKIP[CI("aot_eager", training=True)] = [
     "hf_T5_base",  # fp64_OOM
     "mobilenet_v2_quantized_qat",  # fp64_OOM
     "resnet50_quantized_qat",  # fp64_OOM
-    "moco",
     "pytorch_struct",
-    "vision_maskrcnn",
     # Huggingface
     "MBartForConditionalGeneration",  # OOM
     "M2M100ForConditionalGeneration",  # OOM
@@ -120,36 +164,77 @@ CI_SKIP[CI("aot_eager", training=True)] = [
     "convit_base",  # fp64_OOM
     "fbnetv3_b",  # Accuracy (blocks.2.2.bn1.weight.grad)
     "levit_128",  # Accuracy (patch_embed.0.c.weight.grad)
+    "lcnet_050",  # Accuracy (blocks.1.0.bn2.weight.grad)
     "sebotnet33ts_256",  # Accuracy (stem.conv1.conv.weight.grad)
     "xcit_large_24_p8_224",  # fp64_OOM,
-    "gernet_l",  # accuracy https://github.com/pytorch/pytorch/issues/93847
-    "gluon_xception65",  # accuracy https://github.com/pytorch/pytorch/issues/93847
-    "tinynet_a",  # accuracy https://github.com/pytorch/pytorch/issues/93847
 ]
 
 CI_SKIP[CI("inductor", training=False)] = [
-    *CI_SKIP[CI("aot_eager", training=False)],
+    # TorchBench
+    "DALLE2_pytorch",  # AttributeError: text_encodings
+    # torchrec_dlrm requires gcc-11, https://github.com/pytorch/benchmark/pull/1427
+    "torchrec_dlrm",
+    "demucs",  # OOM
+    "detectron2_fasterrcnn_r_101_c4",
+    "detectron2_fasterrcnn_r_101_dc5",
+    "detectron2_fasterrcnn_r_101_fpn",
+    "detectron2_fasterrcnn_r_50_c4",
+    "detectron2_fasterrcnn_r_50_dc5",
+    "detectron2_fasterrcnn_r_50_fpn",
+    "detectron2_fcos_r_50_fpn",
+    "detectron2_maskrcnn_r_101_c4",
+    "detectron2_maskrcnn_r_101_fpn",
+    "detectron2_maskrcnn_r_50_c4",
+    "detectron2_maskrcnn_r_50_fpn",
     # TorchBench
     "detectron2",
+    "densenet121",  # flaky accuracy
     "hf_T5",  # accuracy
     "hf_BigBird",  # accuracy
     "hf_GPT2_large",  # OOM
     "maml",  # accuracy
     "mobilenet_v2_quantized_qat",  # The eval test only supports CPU
-    "moco",  # accuracy
     "pytorch_struct",  # Test eval is not implemented
     "pyhpc_equation_of_state",  # Accuracy
     "pyhpc_turbulent_kinetic_energy",  # Accuracy
     "tacotron2",
-    "vision_maskrcnn",  # accuracy
+]
+
+CI_SKIP[CI("inductor", training=False, device="cpu")] = [
+    # TorchBench
+    "drq",  # Need to update torchbench
+    "detectron2_fasterrcnn_r_101_c4",
+    "detectron2_fasterrcnn_r_101_dc5",
+    "detectron2_fasterrcnn_r_101_fpn",
+    "detectron2_fasterrcnn_r_50_c4",
+    "detectron2_fasterrcnn_r_50_dc5",
+    "detectron2_fasterrcnn_r_50_fpn",
+    "detectron2_fcos_r_50_fpn",
+    "detectron2_maskrcnn_r_101_c4",
+    "detectron2_maskrcnn_r_101_fpn",
+    "detectron2_maskrcnn_r_50_c4",
+    "detectron2_maskrcnn_r_50_fpn",
+    "doctr_det_predictor",  # requires newer gcc
+    "doctr_reco_predictor",  # requires newer gcc
+    "gat",  # does not work with fp32
+    "gcn",  # does not work with fp32
+    "hf_Bert_large",  # OOM
+    "hf_GPT2_large",  # Intermittent failure on CI
+    "hf_T5_base",  # OOM
+    "mobilenet_v2_quantized_qat",
+    "pyhpc_turbulent_kinetic_energy",
+    "resnet50_quantized_qat",  # Eager model failed to run(Quantize only works on Float Tensor, got Double)
+    "sage",  # does not work with fp32
+    # torchrec_dlrm requires gcc-11, https://github.com/pytorch/benchmark/pull/1427
+    "torchrec_dlrm",
     # Huggingface
-    "AllenaiLongformerBase",
-    "DebertaV2ForQuestionAnswering",  # OOM
-    "OPTForCausalLM",  # OOM
+    "MBartForConditionalGeneration",  # Accuracy https://github.com/pytorch/pytorch/issues/94793
+    "PLBartForConditionalGeneration",  # Accuracy https://github.com/pytorch/pytorch/issues/94794
     # TIMM
     "cait_m36_384",  # Accuracy
-    "botnet26t_256",  # accuracy https://github.com/pytorch/pytorch/issues/93847
-    "gluon_xception65",  # accuracy https://github.com/pytorch/pytorch/issues/93847
+    "pnasnet5large",  # OOM
+    "xcit_large_24_p8_224",  # OOM https://github.com/pytorch/pytorch/issues/95984
+    "opacus_cifar10",  # Fails to run https://github.com/pytorch/pytorch/issues/99201
 ]
 
 CI_SKIP[CI("inductor", training=True)] = [
@@ -160,47 +245,35 @@ CI_SKIP[CI("inductor", training=True)] = [
     "hf_T5_base",  # accuracy
     "mobilenet_v3_large",  # accuracy
     "resnet50_quantized_qat",  # Eager model failed to run
-    # Huggingface
-    "BlenderbotForCausalLM",  # OOM
-    "GoogleFnet",  # Eager model failed to run
-    "MBartForConditionalGeneration",  # OOM
-    "M2M100ForConditionalGeneration",  # OOM
-    "XGLMForCausalLM",  # OOM
-    "MT5ForConditionalGeneration",  # fails accuracy
-    # TIMM
-    "convit_base",  # fp64_OOM
-    "eca_halonext26ts",  # accuracy
-    "fbnetv3_b",  # accuracy
-    "levit_128",  # fp64_OOM
-    # https://github.com/pytorch/pytorch/issues/94066
-    "sebotnet33ts_256",  # Accuracy failed for key name stem.conv1.conv.weight.grad
-    "xcit_large_24_p8_224",  # fp64_OOM
+    "crossvit_9_240",  # fails to run on timm 0.8.22 with cudagraphs, mempools
+    "deit_base_distilled_patch16_224",  # fails to run in timm 0.8.22, cudagraphs
+    "mobilevit_s",
+    "pit_b_224",
+    "twins_pcpvt_base",
+    "visformer_small",
+    "vit_base_patch16_224",
+    "xcit_large_24_p8_224",
 ]
 
 # Skips for dynamic=True
 
 CI_SKIP[CI("aot_eager", training=False, dynamic=True)] = [
     *CI_SKIP[CI("aot_eager", training=False)],
-    # torchbench
-    "vision_maskrcnn",  # 'literal' is an illegal expression for augmented assignment
+    "cm3leon_generate",  # Could not validate constraint UnspecConstraint
+    "hf_T5_generate",  # Could not validate constraint UnspecConstraint
+    "vision_maskrcnn",  # accuracy failure on boxes, after https://github.com/pytorch/pytorch/issues/101093
 ]
 
 CI_SKIP[CI("aot_eager", training=True, dynamic=True)] = [
     *CI_SKIP[CI("aot_eager", training=True)],
     *CI_SKIP[CI("aot_eager", training=False, dynamic=True)],
+    "llama",  # AssertionError: cannot compute free_symbols of True
 ]
 
 CI_SKIP[CI("inductor", training=False, dynamic=True)] = [
     *CI_SKIP[CI("aot_eager", training=False, dynamic=True)],
     *CI_SKIP[CI("inductor", training=False)],
-    # torchbench
-    "LearningToPaint",  # accuracy
-    "functorch_dp_cifar10",  # timeout
-    "opacus_cifar10",  # timeout
-    # timm_models
-    "pnasnet5large",  # ceiling is not defined
-    "swin_base_patch4_window7_224",  # floor is not defined
-    "volo_d1_224",  # ceiling is not defined
+    "nanogpt_generate",  # Assertion `index out of bounds: 0 <= tmp0 < 64` failed.
 ]
 
 CI_SKIP[CI("inductor", training=True, dynamic=True)] = [
@@ -208,9 +281,9 @@ CI_SKIP[CI("inductor", training=True, dynamic=True)] = [
     # *CI_SKIP[CI("aot_eager", training=True, dynamic=True)],
     *CI_SKIP[CI("inductor", training=False, dynamic=True)],
     *CI_SKIP[CI("inductor", training=True)],
-    # TODO: Fill this in
+    "levit_128",  # Accuracy fails on A10G, passes on A100
+    "sebotnet33ts_256",  # Flaky accuracy failed
 ]
-
 
 CI_SKIP_OPTIMIZER = {
     # TIMM
@@ -263,27 +336,21 @@ def load_model_from_path(path_and_class_str):
 
 
 def output_csv(filename, headers, row):
-    assert filename
-    existed = os.path.exists(filename)
-    output = csv.writer(
-        io.TextIOWrapper(
-            open(filename, "ab", buffering=0),
-            "utf-8",
-            write_through=True,
-        ),
-        lineterminator="\n",
-    )
-    if not existed:
-        output.writerow(headers)
-    output.writerow([(f"{x:.4f}" if isinstance(x, float) else x) for x in row])
-
-
-class NullContext:
-    def __enter__(self):
-        pass
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+    if os.path.exists(filename):
+        with open(filename, "r") as fd:
+            lines = list(csv.reader(fd)) or [[]]
+            if headers and len(headers) > len(lines[0]):
+                # if prior results failed the header might not be filled in yet
+                lines[0] = headers
+            else:
+                headers = lines[0]
+    else:
+        lines = [headers]
+    lines.append([(f"{x:.6f}" if isinstance(x, float) else x) for x in row])
+    with open(filename, "w") as fd:
+        writer = csv.writer(fd, lineterminator="\n")
+        for line in lines:
+            writer.writerow(list(line) + ["0"] * (len(headers) - len(line)))
 
 
 def nothing(f):
@@ -311,6 +378,30 @@ def synchronize():
     pass
 
 
+def summarize_graph_break(filename):
+    """
+    Sorts and de-dupes the graphs breaks on the reason string. Note that this
+    function is just a best effort to reduce the logging information. We could
+    miss some graph breaks because of de-duping. We can further refine this
+    function as need arises.
+    """
+    log_file = f"{filename.rstrip('.csv')}_graph_breaks.csv"
+    if os.path.exists(log_file):
+        df = pd.read_csv(log_file)
+        df = df.sort_values("reason").drop_duplicates(subset="reason")
+
+        # Specialize for multi tensor sgd as reason is not identical
+        multi_tensor_sgd_row = df.loc[df["reason"].str.contains("_multi_tensor_sgd")]
+        if len(multi_tensor_sgd_row):
+            df = df[
+                ~df["reason"].str.contains("_multi_tensor_sgd")
+            ]  # Drop all sgd rows
+            df = pd.concat(
+                [df, pd.DataFrame([multi_tensor_sgd_row.iloc[0]])], axis=0
+            )  # Add back a single row
+        df.to_csv(f"{log_file.rstrip('.csv')}_deduped.csv", index=False)
+
+
 def print_summary(filename):
     if not (filename and os.path.exists(filename)):
         return
@@ -323,6 +414,7 @@ def print_summary(filename):
             print_summary_table(data[data.tag == tag])
     else:
         print_summary_table(data)
+    summarize_graph_break(filename)
 
 
 def print_summary_table(data):
@@ -343,7 +435,7 @@ def print_summary_table(data):
                 pass_rate = (data[col] == "pass").mean()
                 print(col.ljust(width), f"pass_rate={100*pass_rate:.2f}%")
             else:
-                cdata = data[col].clip(1)
+                cdata = data[col]
                 print(
                     col.ljust(width),
                     f"gmean={gmean(cdata):.2f}x mean={cdata.mean():.3f}x",
@@ -356,6 +448,13 @@ def tensor_is_on_xla(tensors):
         nonlocal result
         if x.device.type == "xla":
             result = True
+<<<<<<< HEAD
+=======
+
+    result = False
+    tree_map_only(torch.Tensor, visit, tensors)
+    return result
+>>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
 
     result = False
     tree_map_only(torch.Tensor, visit, tensors)
@@ -477,17 +576,17 @@ def speedup_experiment_fx2trt(args, model_iter_fn, model, example_inputs):
 
 
 def recompile_profiler_experiment(args, model_iter_fn, model, example_inputs):
-    prof = torch._dynamo.utils.CompileProfiler()
-    opt_model_iter_fn = torch._dynamo.optimize(prof, nopython=args.nopython)(
-        model_iter_fn
-    )
-    opt_model_iter_fn(model, example_inputs)
-    output_csv(
-        output_filename, ["model", "profiler report"], [current_name, prof.report()]
-    )
-    met = prof.get_metrics()
-    guard_failures = len(met["guard_failures"])
-    return [guard_failures]
+    with torch._dynamo.utils.CompileProfiler() as prof:
+        opt_model_iter_fn = torch._dynamo.optimize(prof, nopython=args.nopython)(
+            model_iter_fn
+        )
+        opt_model_iter_fn(model, example_inputs)
+        output_csv(
+            output_filename, ["model", "profiler report"], [current_name, prof.report()]
+        )
+        met = prof.get_metrics()
+        guard_failures = len(met["guard_failures"])
+        return [guard_failures]
 
 
 def randomize_input(inputs):
@@ -525,23 +624,16 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
 
     Writes to ./speedups.csv
     """
-    if args.dynamic_shapes:
-        return speedup_experiment_ds(args, model_iter_fn, model, example_inputs)
+    # if args.dynamic_shapes:
+    #     return speedup_experiment_ds(args, model_iter_fn, model, example_inputs)
 
     timings = np.zeros((args.repeat, 2), np.float64)
     # if we randomize the input, we should also check the result is correct
     should_check_result = should_randomize_input = args.randomize_input
-    is_correct = True
 
     import contextlib
 
-    @contextlib.contextmanager
-    def maybe_profile(*args, **kwargs):
-        if kwargs.pop("enabled", True):
-            with torch.profiler.profile(*args, **kwargs) as p:
-                yield p
-        else:
-            yield
+    from torch._inductor.utils import maybe_profile
 
     @contextlib.contextmanager
     def maybe_mark_profile(*args, **kwargs):
@@ -560,9 +652,9 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
     tolerance = args.xla_tolerance if args.trace_on_xla else 1e-4
     torch._dynamo.config.repro_tolerance = tolerance
 
-    with maybe_profile(enabled=args.export_profiler_trace) as p:
+    with maybe_profile(args.export_profiler_trace) as p:
         frozen_model_iter_fn = torch._dynamo.run(model_iter_fn)
-        for rep in range(args.repeat):
+        for rep in trange(args.repeat, desc="running benchmark"):
             inputs = (
                 randomize_input(copy.deepcopy(example_inputs))
                 if should_randomize_input
@@ -606,7 +698,6 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         name = args.profiler_trace_name + "_" + model.name + ".json"
         name = os.path.join(torch._dynamo.config.base_dir, name)
         p.export_chrome_trace(name)
-    pvalue = ttest_ind(timings[:, 0], timings[:, 1]).pvalue
     median = np.median(timings, axis=0)
     speedup = median[0] / median[1]
     if args.dump_raw_metrics:
@@ -622,11 +713,41 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         first_fields.append(kwargs["tag"])
     headers = first_headers + ["speedup", "abs_latency"]
     row = first_fields + [float(speedup), median[1] * 1000]
+    msg = f"{speedup:.3f}x"
+    if args.baseline:
+        headers.extend(
+            [
+                "baseline",
+                "speedup_vs_baseline",
+            ]
+        )
+        df = pd.read_csv(args.baseline)
+        try:
+            baseline_speedup = df[df["name"] == current_name]["speedup"].item()
+            row.extend([baseline_speedup, speedup / baseline_speedup])
+            msg = f"{baseline_speedup:.3f}x -> {speedup:.3f}x [{speedup / baseline_speedup:.3f}x]"
+        except (KeyError, ZeroDivisionError):
+            row.extend(
+                [
+                    0.0,
+                    0.0,
+                ]
+            )
     if "compilation_latency" in kwargs:
-        headers += ["compilation_latency", "compression_ratio"]
+        headers += [
+            "compilation_latency",
+            "compression_ratio",
+            "eager_peak_mem",
+            "dynamo_peak_mem",
+        ]
         row.append(kwargs["compilation_latency"])
         row.append(kwargs["compression_ratio"])
-
+        row.append(kwargs["eager_peak_mem"])
+        row.append(kwargs["dynamo_peak_mem"])
+    if "dynamo_stats" in kwargs:
+        for k, v in kwargs["dynamo_stats"].items():
+            headers.append(k)
+            row.append(v)
     output_csv(
         output_filename,
         headers,
@@ -641,7 +762,7 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         first_headers + headers,
         first_fields + data,
     )
-    return format_speedup(speedup, pvalue, is_correct=is_correct)
+    return msg
 
 
 def speedup_experiment_ds(args, model_iter_fn, model, example_inputs):
@@ -688,12 +809,9 @@ def speedup_experiment_ds(args, model_iter_fn, model, example_inputs):
     shapes = [x[0].shape for x in example_inputs]
     shape_keys = sorted(set(shapes))
     shape_speedups = {
-        shape: list(
-            map(
-                lambda it: it[1],
-                filter(lambda it: it[0] == shape, zip(shapes, speedups)),
-            )
-        )
+        shape: [
+            it[1] for it in filter(lambda it: it[0] == shape, zip(shapes, speedups))
+        ]
         for shape in shape_keys
     }
     output_str = (
@@ -797,11 +915,81 @@ def baselines(models, model_iter_fn, example_inputs, args):
     return result
 
 
+def xla(args, model_iter_fn, model, example_inputs):
+    xla_dev = xm.xla_device(devkind=current_device)
+    model_xla = copy.deepcopy(model).to("cpu").to(device=xla_dev)
+    example_inputs_xla = tree_map_only(
+        torch.Tensor, lambda x: x.to("cpu").to(device=xla_dev), example_inputs
+    )
+    for _ in range(3):  # warmup
+        timed(model, model_iter_fn, example_inputs)
+        timed(model_xla, model_iter_fn, example_inputs_xla)
+    timings = np.zeros((args.repeat, 2), np.float64)
+    timings.fill(1.0e10)
+    for rep in range(args.repeat):
+        timings[rep, 0] = timed(model, model_iter_fn, example_inputs)
+        timings[rep, 1] = timed(model_xla, model_iter_fn, example_inputs_xla)
+
+    pvalue = ttest_ind(timings[:, 0], timings[:, 1]).pvalue
+    time_baseline, time_xla = np.median(timings, axis=0)
+    speedup = time_baseline / time_xla
+    output_csv(
+        output_filename,
+        ("dev", "name", "batch_size", "speedup", "time_baseline", "time_xla"),
+        [
+            current_device,
+            current_name,
+            current_batch_size,
+            speedup,
+            time_baseline,
+            time_xla,
+        ],
+    )
+    return format_speedup(speedup, pvalue)
+
+
 def try_script(model, example_inputs):
     try:
         return torch.jit.script(model)
     except Exception:
         return None
+
+
+def download_retry_decorator(download_fn):
+    """
+    Decorator function for applying retry logic to a download function.
+
+    The wrapped function will be called up to 5 times and raises an exception if the function fails each time.
+    After each unsuccessful attempt, there is a delay before the next attempt, which is increased linearly with the number of tries.
+
+    Usage:
+    @download_retry_decorator
+    def download_function(model_name: str):
+        # download logic goes here
+    """
+
+    @functools.wraps(download_fn)
+    def wrapper(self, *args, **kwargs) -> Any:
+        tries = 0
+        total_allowed_tries = MAX_DOWNLOAD_ATTEMPTS
+        while tries <= total_allowed_tries:
+            try:
+                model = download_fn(self, *args, **kwargs)
+                return model
+            except Exception as e:
+                tries += 1
+                if tries <= total_allowed_tries:
+                    wait = tries * 30
+                    print(
+                        f"Failed to load model: {e}. Trying again ({tries}/{total_allowed_tries}) after {wait}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(
+                        f"Failed to load model '{args}' with following error(s): {str(e)}."
+                    )
+
+    return wrapper
 
 
 def read_batch_size_from_file(args, filename, model_name):
@@ -817,7 +1005,7 @@ def read_batch_size_from_file(args, filename, model_name):
             if model_name == cur_name:
                 batch_size = int(b)
     if batch_size is None:
-        log.warning("Could not find batch size for {}".format(model_name))
+        log.warning("Could not find batch size for %s", model_name)
     elif batch_size == -1:
         raise RuntimeError(
             f"Batch size is unset for {model_name} in {args.batch_size_file}"
@@ -912,9 +1100,23 @@ class DummyGradScaler:
         return loss
 
 
+def get_dynamo_stats():
+    # TODO: consider deepcopy'ing the entire counters struct and
+    # adding a helper to do subtraction on it
+    return collections.Counter(
+        {
+            "calls_captured": torch._dynamo.utils.counters["stats"]["calls_captured"],
+            "unique_graphs": torch._dynamo.utils.counters["stats"]["unique_graphs"],
+            "graph_breaks": sum(torch._dynamo.utils.counters["graph_break"].values()),
+            # NB: The plus removes zero counts
+            "unique_graph_breaks": len(+torch._dynamo.utils.counters["graph_break"]),
+        }
+    )
+
+
 def maybe_fresh_cache(fn, is_cold_start):
     def inner(*args, **kwargs):
-        cache_minder = NullContext()
+        cache_minder = contextlib.nullcontext()
         if is_cold_start:
             cache_entries = {}
             cache_minder = fresh_inductor_cache(cache_entries)
@@ -961,7 +1163,7 @@ class BenchmarkRunner:
     def __init__(self):
         self.model_iter_fn = None
         self.grad_scaler = DummyGradScaler()
-        self.autocast = NullContext
+        self.autocast = contextlib.nullcontext
         self.optimizer = None
         self._args = None
 
@@ -989,7 +1191,7 @@ class BenchmarkRunner:
             #  harder.
             # self.grad_scaler = torch.cuda.amp.GradScaler(init_scale=2.0)
             self.autocast = torch.cuda.amp.autocast
-        elif self.args.bfloat16 and self.args.devices == ["cpu"]:
+        elif (self.args.bfloat16 or self.args.amp) and self.args.devices == ["cpu"]:
             self.autocast = torch.cpu.amp.autocast
 
     def init_optimizer(self, name, device, params):
@@ -1008,6 +1210,14 @@ class BenchmarkRunner:
 
     @property
     def skip_models(self):
+        return set()
+
+    @property
+    def skip_models_for_cuda(self):
+        return set()
+
+    @property
+    def skip_models_for_cpu(self):
         return set()
 
     @property
@@ -1040,6 +1250,10 @@ class BenchmarkRunner:
 
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
+        return set()
+
+    @property
+    def skip_accuracy_check_as_eager_non_deterministic(self):
         return set()
 
     @property
@@ -1154,13 +1368,18 @@ class BenchmarkRunner:
         1) Collect the outputs with fp64 datatype. This is useful for error checking.
         2) Checks if eager itself has variations.
         """
+        start_stats = get_dynamo_stats()
 
-        def record_status(accuracy_status):
+        def record_status(accuracy_status, dynamo_start_stats):
             """
             Records the status in the csv file
             """
             if current_name in self.non_deterministic_models:
-                if accuracy_status in ("pass", "eager_variation", "fail_accuracy"):
+                if accuracy_status in (
+                    "pass",
+                    "eager_two_runs_differ",
+                    "fail_accuracy",
+                ):
                     accuracy_status = "pass"
 
             headers = ["dev", "name", "batch_size", "accuracy"]
@@ -1170,11 +1389,17 @@ class BenchmarkRunner:
                 headers.insert(3, "tag")
                 fields.insert(3, tag)
 
+            dynamo_stats = get_dynamo_stats()
+            dynamo_stats.subtract(dynamo_start_stats)
+            for k, v in dynamo_stats.items():
+                headers.append(k)
+                fields.append(v)
+
             output_csv(output_filename, headers, fields)
-            return "PASS" if accuracy_status in ("pass", "pass_due_to_skip") else "FAIL"
+            return accuracy_status
 
         if name in self.skip_accuracy_checks_large_models_dashboard:
-            return record_status("pass_due_to_skip")
+            return record_status("pass_due_to_skip", dynamo_start_stats=start_stats)
 
         def deepcopy_and_maybe_ddp(model):
             model = copy.deepcopy(model)
@@ -1198,12 +1423,11 @@ class BenchmarkRunner:
             fp64_outputs = self.run_n_iterations(model_fp64, inputs_fp64)
         except Exception:
             log.warning(
-                f"fp64 golden ref were not generated for {name}. Setting accuracy check to cosine"
+                "fp64 golden ref were not generated for %s. Setting accuracy check to cosine",
+                name,
             )
             self.args.cosine = True
             fp64_outputs = None
-            if self.args.ci and self.args.training:
-                return record_status("fp64_OOM")
 
         tolerance, cos_similarity = self.get_tolerance_and_cosine_flag(
             self.args.training, current_device, name
@@ -1216,27 +1440,50 @@ class BenchmarkRunner:
         with self.pick_grad(name, self.args.training):
             # Get results of native pytorch
             reset_rng_state()
-            model_copy = deepcopy_and_maybe_ddp(model)
-            self.init_optimizer(name, current_device, model_copy.parameters())
-            correct_result = self.run_n_iterations(
-                model_copy, clone_inputs(example_inputs)
-            )
+            try:
+                model_copy = deepcopy_and_maybe_ddp(model)
+                self.init_optimizer(name, current_device, model_copy.parameters())
+                correct_result = self.run_n_iterations(
+                    model_copy, clone_inputs(example_inputs)
+                )
+            except Exception as e:
+                accuracy_status = (
+                    "eager_1st_run_OOM"
+                    if isinstance(e, torch.cuda.OutOfMemoryError)
+                    else "eager_1st_run_fail"
+                )
+                return record_status(accuracy_status, dynamo_start_stats=start_stats)
 
             # Rerun native pytorch
             reset_rng_state()
-            model_copy = deepcopy_and_maybe_ddp(model)
-            self.init_optimizer(name, current_device, model_copy.parameters())
-            correct_rerun_result = self.run_n_iterations(
-                model_copy, clone_inputs(example_inputs)
-            )
-            if not same(
-                correct_result,
-                correct_rerun_result,
-                fp64_outputs,
-                equal_nan=self.equal_nan,
+            try:
+                model_copy = deepcopy_and_maybe_ddp(model)
+                self.init_optimizer(name, current_device, model_copy.parameters())
+                correct_rerun_result = self.run_n_iterations(
+                    model_copy, clone_inputs(example_inputs)
+                )
+            except Exception as e:
+                accuracy_status = (
+                    "eager_2nd_run_OOM"
+                    if isinstance(e, torch.cuda.OutOfMemoryError)
+                    else "eager_2nd_run_fail"
+                )
+                return record_status(accuracy_status, dynamo_start_stats=start_stats)
+
+            # Two eager runs should have exactly same result
+            if (
+                name not in self.skip_accuracy_check_as_eager_non_deterministic
+                and not same(
+                    correct_result,
+                    correct_rerun_result,
+                    fp64_ref=None,
+                    cos_similarity=False,
+                    tol=0,
+                    equal_nan=self.equal_nan,
+                )
             ):
-                accuracy_status = "eager_variation"
-                return record_status(accuracy_status)
+                accuracy_status = "eager_two_runs_differ"
+                return record_status(accuracy_status, dynamo_start_stats=start_stats)
             correct_rerun_result = None
 
             # Run with Dynamo
@@ -1260,13 +1507,25 @@ class BenchmarkRunner:
                     )
                 ):
                     accuracy_status = "pass_due_to_skip"
-                    return record_status(accuracy_status)
+                    return record_status(
+                        accuracy_status, dynamo_start_stats=start_stats
+                    )
                 else:
                     print(
                         "TorchDynamo optimized model failed to run because of following error"
                     )
-                    accuracy_status = "fail_to_run"
-                    return record_status(accuracy_status)
+                    accuracy_status = (
+                        "OOM"
+                        if isinstance(e, torch.cuda.OutOfMemoryError)
+                        else "fail_to_run"
+                    )
+                    return record_status(
+                        accuracy_status, dynamo_start_stats=start_stats
+                    )
+
+            if name in self.skip_accuracy_check_as_eager_non_deterministic:
+                return record_status("pass_due_to_skip", dynamo_start_stats=start_stats)
+
             if not same(
                 correct_result,
                 new_result,
@@ -1279,9 +1538,9 @@ class BenchmarkRunner:
                     accuracy_status = "pass_due_to_skip"
                 else:
                     accuracy_status = "fail_accuracy"
-                return record_status(accuracy_status)
+                return record_status(accuracy_status, dynamo_start_stats=start_stats)
 
-        return record_status(accuracy_status)
+        return record_status(accuracy_status, dynamo_start_stats=start_stats)
 
     def check_tolerance(
         self, name, model, example_inputs, optimize_ctx, base_device="cpu"
@@ -1362,8 +1621,13 @@ class BenchmarkRunner:
     def run_performance_test(
         self, name, model, example_inputs, optimize_ctx, experiment, tag=None
     ):
+        if self.args.xla:
+            with self.pick_grad(name, self.args.training):
+                return experiment(*self.maybe_cast(model, example_inputs))
+
         def warmup(fn, model, example_inputs, mode, niters=5):
             peak_mem = 0
+            start_stats = get_dynamo_stats()
             try:
                 if current_device == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -1379,10 +1643,12 @@ class BenchmarkRunner:
                     total = psutil.virtual_memory().total
                     percentage = psutil.Process(os.getpid()).memory_percent()
                     peak_mem = percentage * total / 10**9
-            except Exception as e:
-                log.exception(f"Failed for {mode} {e}")
+            except Exception:
+                log.exception("Backend %s failed in warmup()", mode)
                 return sys.exit(-1)
-            return latency, peak_mem
+            dynamo_stats = get_dynamo_stats()
+            dynamo_stats.subtract(start_stats)
+            return latency, peak_mem, dynamo_stats
 
         # Cast the model to float16/float32 as necessary
         model, example_inputs = self.maybe_cast(model, example_inputs)
@@ -1394,11 +1660,11 @@ class BenchmarkRunner:
                 experiment_kwargs["tag"] = tag
             results = []
 
-            eager_latency, eager_peak_mem = warmup(
+            eager_latency, eager_peak_mem, _ = warmup(
                 self.model_iter_fn, model, example_inputs, "eager"
             )
             optimized_model_iter_fn = optimize_ctx(self.model_iter_fn)
-            dynamo_latency, dynamo_peak_mem = warmup(
+            dynamo_latency, dynamo_peak_mem, dynamo_stats = warmup(
                 optimized_model_iter_fn, model, example_inputs, "dynamo"
             )
 
@@ -1406,15 +1672,19 @@ class BenchmarkRunner:
             compression_ratio = (
                 eager_peak_mem / dynamo_peak_mem if dynamo_peak_mem else 0.0
             )
-            # print(
-            #     f"memory: eager: {eager_peak_mem:.2f} GB, "
-            #     f"dynamo: {dynamo_peak_mem:.2f} GB, "
-            #     f"ratio: {compression_ratio:.2f}"
-            # )
+            if self.args.print_memory:
+                print(
+                    f"memory: eager: {eager_peak_mem:.2f} GB, "
+                    f"dynamo: {dynamo_peak_mem:.2f} GB, "
+                    f"ratio: {compression_ratio:.2f}"
+                )
 
             if experiment.func is speedup_experiment:
                 experiment_kwargs["compilation_latency"] = compilation_time
                 experiment_kwargs["compression_ratio"] = compression_ratio
+                experiment_kwargs["eager_peak_mem"] = eager_peak_mem
+                experiment_kwargs["dynamo_peak_mem"] = dynamo_peak_mem
+                experiment_kwargs["dynamo_stats"] = dynamo_stats
 
             if experiment.func is coverage_experiment:
                 ok, total = Stats.reset_counters()
@@ -1452,30 +1722,9 @@ class BenchmarkRunner:
         msg = f"{current_device:4} {mode:5} {current_name:34} "
         if tag:
             msg += f" {tag:26}"
-        print(msg, end=" ", flush=True)
+        print(msg, flush=True)
 
-        def get_stats():
-            # TODO: consider deepcopy'ing the entire counters struct and
-            # adding a helper to do subtraction on it
-            return collections.Counter(
-                {
-                    "calls_captured": torch._dynamo.utils.counters["stats"][
-                        "calls_captured"
-                    ],
-                    "unique_graphs": torch._dynamo.utils.counters["stats"][
-                        "unique_graphs"
-                    ],
-                    "graph_breaks": sum(
-                        torch._dynamo.utils.counters["graph_break"].values()
-                    ),
-                    # NB: The plus removes zero counts
-                    "unique_graph_breaks": len(
-                        +torch._dynamo.utils.counters["graph_break"]
-                    ),
-                }
-            )
-
-        start_stats = get_stats()
+        start_stats = get_dynamo_stats()
 
         if self.args.accuracy:
             status = self.check_accuracy(
@@ -1505,8 +1754,7 @@ class BenchmarkRunner:
                 )
             )
             print(stats)
-
-        stats = get_stats()
+        stats = get_dynamo_stats()
         stats.subtract(start_stats)
 
         if explain:
@@ -1515,6 +1763,27 @@ class BenchmarkRunner:
                 f"covering {stats['calls_captured']} ops with "
                 f"{stats['graph_breaks']} graph breaks ({stats['unique_graph_breaks']} unique)"
             )
+
+        if explain or self.args.log_graph_breaks or self.args.print_graph_breaks:
+            filename = f"{output_filename.rstrip('.csv')}_graph_breaks.csv"
+
+            def add_double_quotes(x):
+                # Delimiter because reason could have comma
+                return f'"{x}"'
+
+            for graph_break in graph_break_reasons:
+                reason = add_double_quotes(graph_break.reason)
+                user_stack = add_double_quotes(
+                    ", ".join([str(x) for x in graph_break.user_stack])
+                )
+                output_csv(
+                    filename,
+                    ["model", "reason", "user_stack"],
+                    [current_name, reason, user_stack],
+                )
+
+        if self.args.stats:
+            Stats.print_summary()
 
 
 def help(fn):
@@ -1617,6 +1886,9 @@ def parse_args(args=None):
     )
     parser.add_argument("--cosine", action="store_true", help="use cosine similarity")
     parser.add_argument(
+        "--cpp-wrapper", action="store_true", help="turn on cpp/cuda wrapper codegen"
+    )
+    parser.add_argument(
         "--ci", action="store_true", help="Flag to tell that its a CI run"
     )
     parser.add_argument(
@@ -1665,11 +1937,6 @@ def parse_args(args=None):
     """,
     )
     parser.add_argument(
-        "--training",
-        action="store_true",
-        help="Performs training",
-    )
-    parser.add_argument(
         "--ddp",
         action="store_true",
         help="Wraps model in DDP before running it, and uses dynamo DDPOptmizer (graph breaks) by default.",
@@ -1695,6 +1962,14 @@ def parse_args(args=None):
         "--dynamic-shapes",
         action="store_true",
         help="Runs a dynamic shapes version of the benchmark, if available.",
+    )
+    parser.add_argument(
+        "--dynamic-batch-only",
+        action="store_true",
+        help="Only assume batch dimension is dynamic.  Implies --dynamic-shapes",
+    )
+    parser.add_argument(
+        "--specialize-int", action="store_true", help="Run with specialize_int=True."
     )
     parser.add_argument(
         "--use-eval-mode",
@@ -1730,6 +2005,10 @@ def parse_args(args=None):
         help="Overrides the directory to place output files.",
     )
     parser.add_argument(
+        "--baseline",
+        help="Compare with a prior --output",
+    )
+    parser.add_argument(
         "--part",
         default=None,
         help="Specify the part of the model to run.",
@@ -1744,23 +2023,29 @@ def parse_args(args=None):
         "--profiler_trace_name",
         help="Overwrites exported trace name",
     )
-
     parser.add_argument(
         "--diff-branch",
         default=diff_branch_default,
         help="delta current branch against given branch.",
     )
-
     parser.add_argument(
         "--tag", default=None, help="Specify a tag to be included in csv files."
     )
-
     parser.add_argument(
         "--explain",
         action="store_true",
         help="print some graph/op statistics during the run, similar to .explain()",
     )
-
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="print graph counter stats",
+    )
+    parser.add_argument(
+        "--print-memory",
+        action="store_true",
+        help="print extra memory statistics",
+    )
     parser.add_argument(
         "--cold-start-latency",
         "--cold_start_latency",
@@ -1773,9 +2058,34 @@ def parse_args(args=None):
         help="Disables cudagraphs for Inductor",
     )
     parser.add_argument(
+        "--disable-split-reductions",
+        action="store_true",
+        help="Disables split reductions for Inductor",
+    )
+    parser.add_argument(
+        "--disable-persistent-reductions",
+        action="store_true",
+        help="Disables split reductions for Inductor",
+    )
+    parser.add_argument(
+        "--disable-divisible-by-16",
+        action="store_true",
+        help="Disables divisible by 16 hint to Triton for Inductor",
+    )
+    parser.add_argument(
+        "--inductor-compile-mode",
+        default=None,
+        help="torch.compile mode argument for inductor runs.",
+    )
+    parser.add_argument(
         "--print-graph-breaks",
         action="store_true",
         help="Show a warning whenever graph break",
+    )
+    parser.add_argument(
+        "--log-graph-breaks",
+        action="store_true",
+        help="log graph breaks in a file",
     )
     parser.add_argument(
         "--trace-on-xla",
@@ -1806,10 +2116,16 @@ def parse_args(args=None):
     parser.add_argument(
         "--timeout",
         type=int,
-        default=1200,
-        help="timeout (ms) for benchmarking.",
+        default=1800,
+        help="timeout (second) for benchmarking.",
     )
 
+    parser.add_argument(
+        "--per_process_memory_fraction",
+        type=float,
+        default=1,
+        help="Set per-process GPU memory fraction (limit) for reducing usable size and reproducing OOMs",
+    )
     group_fuser = parser.add_mutually_exclusive_group()
     # --nvfuser is now the default, keep the option to not break scripts
     group_fuser.add_argument("--nvfuser", action="store_true", help=argparse.SUPPRESS)
@@ -1869,6 +2185,9 @@ def parse_args(args=None):
         help="Measure speedup with TorchInductor",
     )
     group.add_argument(
+        "--xla", action="store_true", help="Compare TorchXLA to eager PyTorch"
+    )
+    group.add_argument(
         "--backend",
         choices=torch._dynamo.list_backends(exclude_tags=None),
         help="measure speedup with a given backend",
@@ -1900,10 +2219,22 @@ def parse_args(args=None):
     mode_group.add_argument(
         "--performance", action="store_true", help="Measures performance speedup"
     )
+<<<<<<< HEAD
     mode_group.add_argument(
         "--tolerance",
         action="store_true",
         help="extracts the tolerance for each model with small batch size and eval mode",
+=======
+
+    run_mode_group = parser.add_mutually_exclusive_group(required=True)
+    run_mode_group.add_argument(
+        "--training",
+        action="store_true",
+        help="Performs training",
+    )
+    run_mode_group.add_argument(
+        "--inference", action="store_true", help="Performs inference"
+>>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
     )
     return parser.parse_args(args)
 
@@ -1912,6 +2243,8 @@ def main(runner, original_dir=None):
     if original_dir:
         os.chdir(original_dir)
     args = parse_args()
+    if args.baseline:
+        args.baseline = os.path.abspath(args.baseline)
 
     if should_diff_branch(args):
         import git
@@ -1931,9 +2264,9 @@ def main(runner, original_dir=None):
     with maybe_init_distributed(
         (args.ddp or args.fsdp) and args.only, port=args.distributed_master_port
     ):
-        return maybe_fresh_cache(run, args.cold_start_latency and args.only)(
-            runner, args, original_dir
-        )
+        return maybe_fresh_cache(
+            run, (args.cold_start_latency and args.only) or args.ci
+        )(runner, args, original_dir)
 
 
 def run(runner, args, original_dir=None):
@@ -1950,10 +2283,19 @@ def run(runner, args, original_dir=None):
     if args.dynamic_ci_skips_only:
         args.dynamic_shapes = True
         args.ci = True
+    if args.dynamic_batch_only:
+        args.dynamic_shapes = True
+        torch._dynamo.config.assume_static_by_default = True
     if args.dynamic_shapes:
         torch._dynamo.config.dynamic_shapes = True
+        if not args.dynamic_batch_only:
+            torch._dynamo.config.assume_static_by_default = False
+    if args.specialize_int:
+        torch._dynamo.config.specialize_int = True
     if args.ci:
-        args.repeat = 2
+        if args.accuracy:
+            # Run fewer iterations when checking accuracy
+            args.repeat = 2
         if args.dynamic_ci_skips_only:
             # Test only the incremental set of jobs whose skipped was
             # caused solely by turning on dynamic shapes
@@ -1963,9 +2305,11 @@ def run(runner, args, original_dir=None):
                 set(CI_SKIP[ci(dynamic=True)]) - set(CI_SKIP[ci(dynamic=False)])
             )
         else:
-            args.exclude_exact = CI_SKIP[
-                CI(args.backend, training=args.training, dynamic=args.dynamic_shapes)
-            ]
+            ci = functools.partial(
+                CI, args.backend, training=args.training, dynamic=args.dynamic_shapes
+            )
+            for device in args.devices:
+                args.exclude_exact.extend(CI_SKIP[ci(device=device)])
     if args.ddp:
         # TODO: we could also hook DDP bench up to --speedup bench, _not_ for mgpu e2e perf,
         # but just to measure impact on singlenode of performing graph-breaks.
@@ -2003,7 +2347,21 @@ def run(runner, args, original_dir=None):
             # TODO - Using train mode for timm_models. Move to train mode for HF and Torchbench as well.
             args.use_eval_mode = True
         inductor_config.fallback_random = True
+        if args.only is not None and args.only not in {
+            "alexnet",
+            "Background_Matting",
+            "pytorch_CycleGAN_and_pix2pix",
+            "pytorch_unet",
+            "Super_SloMo",
+            "vgg16",
+        }:
+            # some of the models do not support use_deterministic_algorithms
+            torch.use_deterministic_algorithms(True)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
 
         # Remove randomeness when torch manual seed is called
         patch_torch_manual_seed()
@@ -2048,14 +2406,6 @@ def run(runner, args, original_dir=None):
                 "hf_Longformer",
                 "timm_nfnet",
                 "timm_efficientdet",
-                # timm
-                "beit_base_patch16_224",
-                "cait_m36_384",
-                "convmixer_768_32",
-                "deit_base_distilled_patch16_224",
-                "dm_nfnet_f0",
-                "dpn107",
-                "dm_nfnet_f0",
             }
         )
         if args.training:
@@ -2075,13 +2425,13 @@ def run(runner, args, original_dir=None):
         torch.set_num_threads(args.threads)
 
     if args.verbose:
-        torch._dynamo.config.log_level = logging.DEBUG
+        torch._logging.set_logs(dynamo=logging.DEBUG)
 
     if args.print_graph_breaks:
         torch._dynamo.config.print_graph_breaks = True
 
     if args.quiet:
-        torch._dynamo.config.log_level = logging.ERROR
+        torch._logging.set_logs(dynamo=logging.ERROR)
 
     torch._dynamo.config.suppress_errors = args.suppress_errors
 
@@ -2096,6 +2446,9 @@ def run(runner, args, original_dir=None):
 
     if args.devices == ["cpu"]:
         runner.skip_models.update(runner.very_slow_models)
+        runner.skip_models.update(runner.skip_models_for_cpu)
+    elif args.devices == ["cuda"]:
+        runner.skip_models.update(runner.skip_models_for_cuda)
 
     if args.inductor or args.inductor_settings:
         runner.skip_models.update(runner.failing_torchinductor_models)
@@ -2121,7 +2474,7 @@ def run(runner, args, original_dir=None):
 
     experiment = null_experiment
     global current_name, current_device, current_batch_size, output_filename, optimize_ctx
-    optimize_ctx = NullContext()
+    optimize_ctx = contextlib.nullcontext()
 
     if args.overhead:
         optimize_ctx = torch._dynamo.optimize(dummy_fx_compile, nopython=args.nopython)
@@ -2129,12 +2482,32 @@ def run(runner, args, original_dir=None):
         output_filename = "overheads.csv"
     elif args.inductor:
         inductor_config.debug = args.verbose
+        if (
+            args.ci
+            and args.accuracy
+            and args.training
+            and args.only in {"dla102", "gernet_l"}
+        ):
+            # Log generated code for flaky tests, to check if there is any codegen difference
+            inductor_config.debug = True
+
         if args.threads:
             inductor_config.cpp.threads = args.threads
 
-        optimize_ctx = torch._dynamo.optimize("inductor", nopython=args.nopython)
+        optimize_ctx = functools.partial(
+            torch.compile,
+            backend="inductor",
+            fullgraph=args.nopython,
+            mode=args.inductor_compile_mode,
+        )
         experiment = speedup_experiment
         output_filename = "inductor.csv"
+    elif args.xla:
+        (dev,) = args.devices
+        os.environ["PJRT_DEVICE"] = {"cuda": "GPU", "cpu": "CPU"}[dev]
+        torch._dynamo.mark_dynamic = MagicMock()
+        experiment = xla
+        output_filename = "xla.csv"
     elif args.speedup_dynamo_ts:
         optimize_ctx = torch._dynamo.optimize("ts", nopython=args.nopython)
         experiment = speedup_experiment
@@ -2156,6 +2529,7 @@ def run(runner, args, original_dir=None):
         )
     elif args.nothing:
         optimize_ctx = nothing
+        experiment = speedup_experiment
         output_filename = "nothing.csv"
     elif args.backend:
         optimize_ctx = torch._dynamo.optimize(args.backend, nopython=args.nopython)
@@ -2178,6 +2552,12 @@ def run(runner, args, original_dir=None):
 
     if args.inductor or args.backend == "inductor":
         inductor_config.triton.cudagraphs = not args.disable_cudagraphs
+        inductor_config.triton.persistent_reductions = (
+            not args.disable_persistent_reductions
+        )
+        inductor_config.split_reductions = not args.disable_split_reductions
+        inductor_config.triton.divisible_by_16 = not args.disable_divisible_by_16
+        inductor_config.cpp_wrapper = args.cpp_wrapper
 
     runner.setup_amp()
 
@@ -2242,40 +2622,48 @@ def run(runner, args, original_dir=None):
                 model, example_inputs = load_model_from_path(args.only)
                 name = model.__class__.__name__
                 model = model.to(device=device)
-                example_inputs = tree_map(lambda x: x.to(device=device), example_inputs)
+                example_inputs = tree_map_only(
+                    torch.Tensor, lambda x: x.to(device=device), example_inputs
+                )
             else:
                 try:
-                    if args.part:
-                        (
-                            device,
-                            name,
-                            model,
-                            example_inputs,
-                            batch_size,
-                        ) = runner.load_model(
-                            device, model_name, batch_size=batch_size, part=args.part
-                        )
-                    else:
-                        (
-                            device,
-                            name,
-                            model,
-                            example_inputs,
-                            batch_size,
-                        ) = runner.load_model(device, model_name, batch_size=batch_size)
+                    with tqdm(desc="loading model"):
+                        if args.part:
+                            (
+                                device,
+                                name,
+                                model,
+                                example_inputs,
+                                batch_size,
+                            ) = runner.load_model(
+                                device,
+                                model_name,
+                                batch_size=batch_size,
+                                part=args.part,
+                            )
+                        else:
+                            (
+                                device,
+                                name,
+                                model,
+                                example_inputs,
+                                batch_size,
+                            ) = runner.load_model(
+                                device, model_name, batch_size=batch_size
+                            )
                 except NotImplementedError as e:
                     print(e)
                     import traceback
 
                     print(traceback.format_exc())
-                    logging.warning(f"{args.only} failed to load")
+                    logging.warning("%s failed to load", args.only)
                     continue  # bad benchmark implementation
 
             if args.trace_on_xla:
                 xla_dev = xm.xla_device()
                 model = model.to(device=xla_dev)
-                example_inputs = tree_map(
-                    lambda x: x.to(device=xla_dev), example_inputs
+                example_inputs = tree_map_only(
+                    torch.Tensor, lambda x: x.to(device=xla_dev), example_inputs
                 )
 
             current_name = name
@@ -2290,11 +2678,36 @@ def run(runner, args, original_dir=None):
             elif args.bfloat16:
                 model, example_inputs = cast_to_bf16(model, example_inputs)
 
+            # Look for stuff that looks like batch size, and mark it dynamic.
+            # Better integration would integrate directly with benchmark suite
+            # but cannot conveniently do this
+            # NB: This must be done late enough so that we don't do more
+            # conversions on the inputs
+            # NB: Assumes only the first batch-y like dimension is the batch
+            marked = False
+
+            def detect_and_mark_batch(t):
+                nonlocal marked
+                for i, s in enumerate(t.size()):
+                    if s == batch_size:
+                        torch._dynamo.mark_dynamic(t, i)
+                        marked = True
+                        break
+
+            if args.dynamic_batch_only and batch_size > 1:
+                tree_map_only(torch.Tensor, detect_and_mark_batch, example_inputs)
+                assert marked, f"nothing in example_inputs had a dim with {batch_size}"
+
             if args.log_operator_inputs:
                 log_operator_inputs(
                     model, example_inputs, runner.model_iter_fn, name, args
                 )
                 continue
+
+            if args.per_process_memory_fraction != 1:
+                torch.cuda.set_per_process_memory_fraction(
+                    args.per_process_memory_fraction
+                )
 
             runner.run_one_model(
                 name,
@@ -2330,10 +2743,12 @@ def run(runner, args, original_dir=None):
             if args.progress:
                 print(f"Running model {i+1}/{nmodels}", flush=True)
 
-            def write_csv():
+            def write_csv(status):
                 for device in args.devices:
                     output_csv(
-                        output_filename, [], [device, name, placeholder_batch_size, 0.0]
+                        output_filename,
+                        ["dev", "name", "batch_size", "accuracy"],
+                        [device, name, placeholder_batch_size, status],
                     )
 
             try:
@@ -2345,10 +2760,10 @@ def run(runner, args, original_dir=None):
                 )
             except subprocess.TimeoutExpired:
                 print("TIMEOUT", file=sys.stderr)
-                write_csv()
+                write_csv("timeout")
             except subprocess.SubprocessError:
                 print("ERROR", file=sys.stderr)
-                write_csv()
+                write_csv("infra_error")
         print_summary(output_filename)
 
 

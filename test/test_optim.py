@@ -1,14 +1,11 @@
 # Owner(s): ["module: optimizer"]
 
-import warnings
-import math
-import unittest
-import functools
-import itertools
-import pickle
-from copy import deepcopy
-import weakref
+from optim.test_optim import TestOptim, TestDifferentiableOptimizer  # noqa: F401
+from optim.test_lrscheduler import TestLRScheduler  # noqa: F401
+from optim.test_swa_utils import TestSWAUtils  # noqa: F401
+from torch.testing._internal.common_utils import run_tests
 
+<<<<<<< HEAD
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -4576,4 +4573,7 @@ class TestDifferentiableOptimizer(TestCase):
 
 
 if __name__ == "__main__":
+=======
+if __name__ == '__main__':
+>>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
     run_tests()

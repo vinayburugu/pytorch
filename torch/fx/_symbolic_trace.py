@@ -580,7 +580,7 @@ class Tracer(TracerBase):
                     out = self.create_proxy(
                         "placeholder", f"{name}_{str(cnt)}", default, {}
                     )
-                    if x == PH:
+                    if isinstance(x, PHBase):
                         return out
                     # Union[int, bool] == bool in Python <= 3.6
                     if (
@@ -627,7 +627,7 @@ class Tracer(TracerBase):
                 raise RuntimeError(
                     f"Tracing expected {len(arg_names)} arguments but got {len(concrete_args)} concrete arguments"
                 )
-            concrete_args = {name: val for name, val in zip(arg_names, concrete_args)}
+            concrete_args = dict(zip(arg_names, concrete_args))
         args.extend(proxy_placeholder(names) for names in arg_names)
 
         if co.co_kwonlyargcount > 0 or co.co_flags & HAS_VARSTUFF:

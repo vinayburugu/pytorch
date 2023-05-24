@@ -20,8 +20,6 @@ def _no_hook(module: nn.Module):
     checkpoint.state(module).enable_hook = False
     try:
         yield
-    except Exception:
-        raise
     finally:
         checkpoint.state(module).enable_hook = orig_enable_hook
 
@@ -212,6 +210,7 @@ def checkpoint(module: nn.Module, *, use_reentrant: bool = True) -> nn.Module:
         >>> model(torch.zeros(2, 10)).sum().backward()
 
     """
+    torch._C._log_api_usage_once("torch.distributed.checkpoint")
 
     def forward_pre_hook(module: nn.Module, inputs: Tuple[Any, ...]) -> None:
         if checkpoint.state(module).enable_hook:

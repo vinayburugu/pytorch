@@ -81,7 +81,7 @@ def get_rocm_version():
 def check_cuda():
     import torch
 
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return None
 
     torch_cuda_ver = packaging.version.parse(torch.version.cuda)
@@ -215,9 +215,14 @@ def main():
         f"ROCM version: {rocm_ver}\n"
     )
     for args in _SANITY_CHECK_ARGS:
+<<<<<<< HEAD
         # TODO remove check when 3.11 is supported
         if sys.version_info >= (3, 11):
             warnings.warn("Dynamo not yet supported in Python 3.11. Skipping check.")
+=======
+        if sys.version_info >= (3, 12):
+            warnings.warn("Dynamo not yet supported in Python 3.12. Skipping check.")
+>>>>>>> 2e2a74670dc231078666f8fbc16b63766ebe480b
             continue
         check_dynamo(*args)
     print("All required checks passed")

@@ -64,6 +64,7 @@ third_party/build/
 tools/coverage_plugins_package/pip-wheel-metadata/
 tools/shared/_utils_internal.py
 tools/fast_nvcc/wrap_nvcc.sh
+tools/fast_nvcc/wrap_nvcc.bat
 tools/fast_nvcc/tmp/
 torch.egg-info/
 torch/_C/__init__.pyi
@@ -226,7 +227,9 @@ docs/source/scripts/quantization_backend_configs/
 ## Caffe2
 
 # build, distribute, and bins (+ python proto bindings)
-build
+build/
+# Allow tools/build/ for build support.
+!tools/build/
 build_host_protoc
 build_android
 build_ios
@@ -323,6 +326,7 @@ bazel-*
 xla/
 
 # direnv, posh-direnv
+.env
 .envrc
 .psenvrc
 
@@ -356,3 +360,4 @@ venv/
 
 # Log files
 *.log
+sweep/

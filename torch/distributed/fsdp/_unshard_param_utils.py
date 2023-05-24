@@ -21,7 +21,7 @@ from torch.distributed.fsdp._runtime_utils import (
     _unshard,
     _unshard_grads,
 )
-from ._utils import p_assert
+from torch.distributed.utils import _p_assert
 from .flat_param import FlatParamHandle
 
 FLAT_PARAM = "_flat_param"
@@ -171,7 +171,7 @@ def _unshard_fsdp_state_params(
     _validate_unshard_params_args(
         state, writeback, rank0_only, offload_to_cpu, with_grads
     )
-    torch.cuda.synchronize()
+    state._device_handle.synchronize()
     # If handles are shared by other module(s), the handle may be already unsharded.
     handles = [
         handle
@@ -194,7 +194,7 @@ def _unshard_fsdp_state_params(
     free_unsharded_flat_params = [handle.needs_unshard() for handle in handles]
     # No need to call `wait_stream()` since we unshard in the computation
     # stream directly
-    computation_stream = torch.cuda.current_stream()
+    computation_stream = state._device_handle.current_stream()
     _unshard(state, handles, computation_stream, computation_stream)
     if with_grads:
         _unshard_grads(handles)
@@ -336,7 +336,7 @@ def _deregister_orig_params(state: _FSDPState, module: nn.Module) -> None:
     Deregisters the original parameters; registers the ``FlatParameter``.
     """
     handles = _module_handles(state, module)
-    p_assert(
+    _p_assert(
         len(handles) <= 1,
         "Expects <=1 handle per FSDP instance; needs to be refactored "
         "for >1 handle (e.g. non-recursive wrapping)",
@@ -344,7 +344,7 @@ def _deregister_orig_params(state: _FSDPState, module: nn.Module) -> None:
     if not handles:
         return
     handle = handles[0]
-    p_assert(
+    _p_assert(
         handle._use_orig_params,
         f"Inconsistent `_use_orig_params` -- FSDP: {state._use_orig_params} "
         f"handle: {handle._use_orig_params}",

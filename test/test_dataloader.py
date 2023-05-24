@@ -25,13 +25,14 @@ from torch.utils.data import (
     IterDataPipe,
     Subset,
     TensorDataset,
+    StackDataset,
     _utils
 )
 from torch.utils.data._utils import MP_STATUS_CHECK_INTERVAL
 from torch.utils.data.dataset import random_split
 from torch.utils.data.datapipes.iter import IterableWrapper
 from torch._utils import ExceptionWrapper
-from torch.testing._internal.common_utils import (TestCase, run_tests, TEST_NUMPY, IS_WINDOWS,
+from torch.testing._internal.common_utils import (TestCase, run_tests, TEST_NUMPY, IS_WINDOWS, IS_JETSON,
                                                   IS_CI, NO_MULTIPROCESSING_SPAWN, skipIfRocm, slowTest,
                                                   load_tests, TEST_WITH_ASAN, TEST_WITH_TSAN, IS_SANDCASTLE,
                                                   IS_MACOS)
@@ -79,10 +80,7 @@ load_tests = load_tests
 # CUDA OOM error on Windows.
 TEST_CUDA = torch.cuda.is_available()
 if TEST_CUDA:
-    dev_name = torch.cuda.get_device_name(torch.cuda.current_device()).lower()
-    IS_JETSON = 'xavier' in dev_name or 'nano' in dev_name or 'jetson' in dev_name or 'tegra' in dev_name
-else:
-    IS_JETSON = False
+    torch.cuda.memory._set_allocator_settings('expandable_segments:False')
 
 if not NO_MULTIPROCESSING_SPAWN:
     # We want to use `spawn` if able because some of our tests check that the
@@ -362,6 +360,58 @@ class TestTensorDataset(TestCase):
             self.assertEqual(t1[i], source[i][1])
             self.assertEqual(t2[i], source[i][2])
             self.assertEqual(t3[i], source[i][3])
+
+
+@unittest.skipIf(
+    TEST_WITH_TSAN,
+    "Fails with TSAN with the following error: starting new threads after multi-threaded "
+    "fork is not supported. Dying (set die_after_fork=0 to override)")
+class TestStackDataset(TestCase):
+
+    def test_empty(self):
+        with self.assertRaisesRegex(ValueError, "At least one dataset should be passed"):
+            StackDataset()
+
+    def test_mixed(self):
+        with self.assertRaisesRegex(ValueError, "Supported either"):
+            StackDataset(TensorDataset(torch.randn(15, 10)), a=TensorDataset(torch.randn(10, 15)))
+
+    def test_size_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "Size mismatch between datasets"):
+            StackDataset(TensorDataset(torch.randn(15, 10)), TensorDataset(torch.randn(10, 15)))
+        with self.assertRaisesRegex(ValueError, "Size mismatch between datasets"):
+            StackDataset(a=TensorDataset(torch.randn(15, 10)), b=TensorDataset(torch.randn(10, 15)))
+
+    def test_len(self):
+        source = StackDataset(TensorDataset(torch.randn(15, 10)), TensorDataset(torch.randn(15)))
+        self.assertEqual(len(source), 15)
+        source = StackDataset(TensorDataset(torch.randn(15, 10)))
+        self.assertEqual(len(source), 15)
+        source = StackDataset(a=TensorDataset(torch.randn(15, 10)), b=TensorDataset(torch.randn(15)))
+        self.assertEqual(len(source), 15)
+        source = StackDataset(a=TensorDataset(torch.randn(15, 10)))
+        self.assertEqual(len(source), 15)
+
+    def test_single(self):
+        t = TensorDataset(torch.randn(15, 10))
+        source = StackDataset(t)
+        for i in range(15):
+            self.assertEqual(t[i], source[i][0])
+        source = StackDataset(a=t)
+        for i in range(15):
+            self.assertEqual(t[i], source[i]['a'])
+
+    def test_getitem(self):
+        t = TensorDataset(torch.randn(15, 10))
+        l = TensorDataset(torch.randn(15, 5, 4))
+        source = StackDataset(t, l)
+        for i in range(15):
+            self.assertEqual(t[i], source[i][0])
+            self.assertEqual(l[i], source[i][1])
+        source = StackDataset(a=t, b=l)
+        for i in range(15):
+            self.assertEqual(t[i], source[i]['a'])
+            self.assertEqual(l[i], source[i]['b'])
 
 
 @unittest.skipIf(
@@ -1111,6 +1161,7 @@ except RuntimeError as e:
             self.assertTrue(input.is_pinned())
             self.assertTrue(target.is_pinned())
 
+    @unittest.skipIf(IS_JETSON, "Not working on Jetson")
     def test_multiple_dataloaders(self):
         for multiprocessing_context in supported_multiprocessing_contexts:
             loader1_it = iter(self._get_data_loader(self.dataset, num_workers=1))
@@ -1435,6 +1486,7 @@ except RuntimeError as e:
             list(iter(ChainDataset([dataset1, self.dataset])))
 
     @unittest.skipIf(IS_MACOS, "Not working on macos")
+    @unittest.skipIf(IS_MACOS or IS_JETSON, "Not working on macos or Jetson")
     @skipIfRocm  # https://github.com/pytorch/pytorch/issues/90940
     def test_multiprocessing_contexts(self):
         reference = [
@@ -1460,6 +1512,7 @@ except RuntimeError as e:
                     reference, list(self._get_data_loader(ds_cls(counting_ds_n), multiprocessing_context=ctx, **dl_common_args)))
 
     @skipIfNoNumpy
+    @unittest.skipIf(IS_JETSON, "Not working on Jetson")
     def test_multiprocessing_iterdatapipe(self):
         # Testing to make sure that function from global scope (e.g. imported from library) can be serialized
         # and used with multiprocess DataLoader
